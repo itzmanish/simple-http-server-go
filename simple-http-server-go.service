@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/home/ubuntu/bin/simple-http-server-go -port 8081
+ExecStart=/home/ubuntu/bin/simple-http-server-go -mysql_dsn=
 Restart=on-failure
 RestartSec=10
 
