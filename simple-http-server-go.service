@@ -1,0 +1,12 @@
+[Unit]
+Description=Simple http server in go
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/ubuntu/bin/simple-http-server-go -port 8081
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
