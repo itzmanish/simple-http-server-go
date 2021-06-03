@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,7 +20,9 @@ import (
 type key int
 
 type messageType struct {
-	Message string
+	Id        string `json:"id"`
+	Message   string `json:"message"`
+	Timestamp string `json:"created_at"`
 }
 
 const (
@@ -32,6 +35,8 @@ var (
 	mysql_dsn  string
 	healthy    int32
 )
+
+var once sync.Once
 
 func main() {
 	flag.StringVar(&port, "port", "8081", "server listen address")
@@ -55,7 +60,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:        ":" + port,
-		Handler:     http.TimeoutHandler(tracing(nextRequestID)(logging(logger)(router)), 15*time.Second, "Timeout! Server is taking unexpected amount of time to respond."),
+		Handler:     http.TimeoutHandler(tracing(nextRequestID)(logging(logger)(router)), 5*time.Second, "Timeout! Server is taking unexpected amount of time to respond."),
 		ErrorLog:    logger,
 		ReadTimeout: 5 * time.Second,
 		IdleTimeout: 15 * time.Second,
@@ -142,13 +147,13 @@ func addMessage() http.Handler {
 			}
 			defer db.Close()
 			// Prepare statement for inserting data
-			stmtIns, err := db.Prepare("INSERT INTO messages(message, timestamp) VALUES( ?, ? )") // ? = placeholder
+			stmtIns, err := db.Prepare("INSERT INTO messages(message) VALUES(?)") // ? = placeholder
 			if err != nil {
 				http.Error(rw, "Unable to prepare statement", http.StatusInternalServerError)
 				return
 			}
 			defer stmtIns.Close() // Close the statement when we leave main() / the program terminates
-			_, err = stmtIns.Exec(msg.Message, time.Now())
+			_, err = stmtIns.Exec(msg.Message)
 			if err != nil {
 				http.Error(rw, "Unable to insert message", http.StatusInternalServerError)
 				return
@@ -175,11 +180,22 @@ func listMessages() http.Handler {
 			return
 		}
 		var out []messageType
-		err = stmt.QueryRow().Scan(&out)
+		rows, err := stmt.Query()
 		if err != nil {
 			http.Error(rw, "Unable to get messages from db", http.StatusInternalServerError)
 			return
 		}
+		for rows.Next() {
+			var temp messageType
+			err = rows.Scan(&temp.Id, &temp.Message, &temp.Timestamp)
+			if err != nil {
+				log.Println(err)
+				http.Error(rw, "Unable to get messages from db", http.StatusInternalServerError)
+				return
+			}
+			out = append(out, temp)
+		}
+
 		json.NewEncoder(rw).Encode(out)
 	})
 }
@@ -226,5 +242,15 @@ func initDB() (*sql.DB, error) {
 	db.SetConnMaxLifetime(time.Minute * 3)
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(10)
+	once.Do(func() {
+		stmt, err := db.Prepare("CREATE table messages(id int NOT NULL AUTO_INCREMENT, message varchar(500) NOT NULL, timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (id));")
+		if err != nil {
+			log.Println(err)
+		}
+		_, err = stmt.Exec()
+		if err != nil {
+			log.Println(err)
+		}
+	})
 	return db, nil
 }
