@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -10,21 +12,32 @@ import (
 	"os/signal"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 type key int
+
+type messageType struct {
+	Message string
+}
 
 const (
 	requestIDKey key = 0
 )
 
 var (
-	port    string
-	healthy int32
+	port       string
+	access_key string
+	mysql_dsn  string
+	healthy    int32
 )
 
 func main() {
-	flag.StringVar(&port, "port", "80", "server listen address")
+	flag.StringVar(&port, "port", "8081", "server listen address")
+	flag.StringVar(&access_key, "access_key", "c29NZVN1cGVSYW5kb21BbmRTM2NSM3RLM3k=", "Access key for allowing user to post message")
+	flag.StringVar(&mysql_dsn, "mysql_dsn", "", "DSN of mysql db to connect to.")
+
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "Simple server: ", log.LstdFlags)
@@ -32,6 +45,8 @@ func main() {
 
 	router := http.NewServeMux()
 	router.Handle("/", index())
+	router.Handle("/add", addMessage())
+	router.Handle("/messages", listMessages())
 	router.Handle("/health", healthz())
 
 	nextRequestID := func() string {
@@ -39,12 +54,11 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      tracing(nextRequestID)(logging(logger)(router)),
-		ErrorLog:     logger,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  15 * time.Second,
+		Addr:        ":" + port,
+		Handler:     http.TimeoutHandler(tracing(nextRequestID)(logging(logger)(router)), 15*time.Second, "Timeout! Server is taking unexpected amount of time to respond."),
+		ErrorLog:    logger,
+		ReadTimeout: 5 * time.Second,
+		IdleTimeout: 15 * time.Second,
 	}
 
 	done := make(chan bool)
@@ -99,6 +113,77 @@ func healthz() http.Handler {
 	})
 }
 
+func addMessage() http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			access := r.URL.Query().Get("access_key")
+			if len(access) == 0 {
+				http.Error(rw, "Access key is required to send a message", http.StatusUnauthorized)
+				return
+			}
+			if access != access_key {
+				http.Error(rw, "Access key is not valid", http.StatusUnauthorized)
+				return
+			}
+			var msg messageType
+			err := json.NewDecoder(r.Body).Decode(&msg)
+			if err != nil {
+				http.Error(rw, "Unable to read body!", http.StatusBadRequest)
+				return
+			}
+			if len(msg.Message) == 0 {
+				http.Error(rw, "Message is required!", http.StatusBadRequest)
+				return
+			}
+			db, err := initDB()
+			if err != nil {
+				http.Error(rw, "Unable to connect to db", http.StatusInternalServerError)
+				return
+			}
+			defer db.Close()
+			// Prepare statement for inserting data
+			stmtIns, err := db.Prepare("INSERT INTO messages(message, timestamp) VALUES( ?, ? )") // ? = placeholder
+			if err != nil {
+				http.Error(rw, "Unable to prepare statement", http.StatusInternalServerError)
+				return
+			}
+			defer stmtIns.Close() // Close the statement when we leave main() / the program terminates
+			_, err = stmtIns.Exec(msg.Message, time.Now())
+			if err != nil {
+				http.Error(rw, "Unable to insert message", http.StatusInternalServerError)
+				return
+			}
+			fmt.Fprintln(rw, msg.Message, "is inserted.")
+			return
+		}
+		fmt.Fprintln(rw, "Only POST method is allowed!")
+	})
+}
+
+func listMessages() http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		db, err := initDB()
+		if err != nil {
+			http.Error(rw, "Unable to connect to db", http.StatusInternalServerError)
+			return
+		}
+		defer db.Close()
+		stmt, err := db.Prepare("SELECT * from messages")
+		if err != nil {
+			http.Error(rw, "Unable to prepare statement", http.StatusInternalServerError)
+			return
+		}
+		var out []messageType
+		err = stmt.QueryRow().Scan(&out)
+		if err != nil {
+			http.Error(rw, "Unable to get messages from db", http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(rw).Encode(out)
+	})
+}
+
 func logging(logger *log.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -126,4 +211,20 @@ func tracing(nextRequestID func() string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+func initDB() (*sql.DB, error) {
+	db, err := sql.Open("mysql", mysql_dsn)
+	if err != nil {
+		return nil, err
+	}
+	err = db.Ping()
+	if err != nil {
+		return nil, err
+	}
+	// See "Important settings" section.
+	db.SetConnMaxLifetime(time.Minute * 3)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(10)
+	return db, nil
 }
